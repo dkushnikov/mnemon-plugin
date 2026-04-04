@@ -28,7 +28,7 @@ Search across all sources in the knowledge vault. Uses grep (default) or QMD (if
 ### Step 1: Load config
 
 ```bash
-source ~/Mnemon/bin/mnemon-config.sh && load_config
+source ${MNEMON_HOME:-~/Mnemon}/bin/mnemon-config.sh && load_config
 ```
 
 This gives you `$VAULT_PATH`, `$SEARCH_PROVIDER`, `$QMD_COLLECTION`.

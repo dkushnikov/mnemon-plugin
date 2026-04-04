@@ -20,7 +20,7 @@ No parameters needed.
 Call the gateway status action:
 
 ```bash
-~/Mnemon/bin/knowledge-gateway.sh status
+${MNEMON_HOME:-~/Mnemon}/bin/knowledge-gateway.sh status
 ```
 
 The gateway outputs a formatted dashboard. Display it to the user.
@@ -29,7 +29,7 @@ If additional detail is needed (the gateway shows basics), you can augment with:
 
 ```bash
 # Count by origin
-source ~/Mnemon/bin/mnemon-config.sh && load_config
+source ${MNEMON_HOME:-~/Mnemon}/bin/mnemon-config.sh && load_config
 for f in "$VAULT_PATH"/Sources/*/extract.md; do
   grep -m1 '^origin:' "$f" 2>/dev/null
 done | sort | uniq -c | sort -rn
