@@ -12,7 +12,7 @@ Searches the Knowledge vault for sources matching a query. Results are ranked by
 All the logic lives in a bundled Python script. Call it via Bash:
 
 ```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/plugins/mnemon/skills/source-search/scripts/search.py" \
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/source-search/scripts/search.py" \
   --query "<query>" \
   [--domain <domain>] \
   [--limit <n>] \
