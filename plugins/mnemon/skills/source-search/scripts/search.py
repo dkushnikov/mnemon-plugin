@@ -170,20 +170,38 @@ def collect_targets(
     return targets
 
 
-def match_file(path: Path, tokens: list[str]) -> tuple[bool, str | None]:
-    """Check whether the file contains ALL tokens. Return (matched, snippet)."""
+def scan_file(path: Path, tokens: list[str]) -> tuple[set[str], str | None]:
+    """Scan a file and return (set of matched tokens, snippet).
+
+    Returns the *subset* of query tokens that appear in the file, not just a
+    boolean "matched all" verdict. This lets the caller:
+
+    1. Filter to files matching ALL tokens (primary results: intersection).
+    2. If that's empty, fall back to files matching just the most specific
+       token that actually exists in the corpus — using the per-token match
+       counts computed naturally from this scan.
+
+    Returns (empty set, None) if the file can't be read or matches nothing.
+    """
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return False, None
+        return set(), None
     text_lower = text.lower()
-    if not all(t in text_lower for t in tokens):
-        return False, None
-    return True, _extract_snippet(text, tokens)
+    matched = {t for t in tokens if t in text_lower}
+    if not matched:
+        return set(), None
+    return matched, _extract_snippet(text, list(matched))
 
 
 def _extract_snippet(text: str, tokens: list[str], width: int = 200) -> str | None:
-    """Return the first non-frontmatter line containing the longest token."""
+    """Return the first non-frontmatter line containing any of the given tokens.
+
+    Prefers the longest matched token for readability (more specific terms
+    produce more interesting snippets), but will settle for any match.
+    """
+    if not tokens:
+        return None
     seed = max(tokens, key=len)
     lines = text.split("\n")
     in_frontmatter = False
@@ -314,22 +332,50 @@ def main() -> int:
         return 2
 
     targets = collect_targets(vault, args.include_source, args.include_synthesis)
-    results: list[dict] = []
+
+    # Single pass: collect every file that matches at least one token, along
+    # with the set of tokens it matched. Primary results are the subset where
+    # matched == all tokens (AND semantics). Fallback uses per-token counts
+    # computed from the same pass.
+    all_hits: list[tuple[Path, str, set, str | None]] = []
     for path, tier in targets:
-        matched, snippet = match_file(path, tokens)
+        matched, snippet = scan_file(path, tokens)
         if matched:
-            results.append(assemble_result(path, tier, snippet, vault))
+            all_hits.append((path, tier, matched, snippet))
+
+    token_set = set(tokens)
+    primary_hits = [(p, t, m, s) for p, t, m, s in all_hits if m == token_set]
 
     fallback_applied = False
-    if not results and len(tokens) > 1:
-        # Relax to longest token only
-        seed = [max(tokens, key=len)]
-        for path, tier in targets:
-            matched, snippet = match_file(path, seed)
-            if matched:
-                results.append(assemble_result(path, tier, snippet, vault))
-        fallback_applied = True
+    fallback_token: str | None = None
+    if primary_hits:
+        selected_hits = primary_hits
+    elif len(tokens) > 1:
+        # Fallback strategy: pick the most *specific* token that actually
+        # exists in the corpus — not the longest string. Specificity here
+        # means "appears in the fewest files, but at least one". This beats
+        # the naive longest-token heuristic because string length is a poor
+        # proxy for specificity (e.g. "karpathy" < "zyzzytoken" by chars,
+        # but karpathy matches 2 files and zyzzytoken matches 0 — picking
+        # the longest would return empty results).
+        token_counts: dict[str, int] = {t: 0 for t in tokens}
+        for _, _, m, _ in all_hits:
+            for t in m:
+                token_counts[t] += 1
+        viable = {t: c for t, c in token_counts.items() if c > 0}
+        if viable:
+            # Smallest nonzero count = most specific. Ties broken by token
+            # length DESC (prefer longer tokens as tiebreak, since they're
+            # usually more meaningful when counts are equal).
+            fallback_token = min(viable, key=lambda t: (viable[t], -len(t)))
+            selected_hits = [h for h in all_hits if fallback_token in h[2]]
+            fallback_applied = True
+        else:
+            selected_hits = []
+    else:
+        selected_hits = []
 
+    results = [assemble_result(p, t, s, vault) for p, t, _, s in selected_hits]
     results = dedupe_by_folder(results)
     results = apply_domain_filter(results, args.domain)
     results = rank_results(results)
@@ -339,6 +385,7 @@ def main() -> int:
         "query": args.query,
         "tokens": tokens,
         "fallback_applied": fallback_applied,
+        "fallback_token": fallback_token,
         "count": len(results),
         "results": results,
     }
@@ -360,7 +407,10 @@ def _print_human(output: dict) -> None:
     if output["count"] == 0:
         print(f"No sources found for '{output['query']}'.")
         return
-    note = " (fallback: relaxed to longest token)" if output["fallback_applied"] else ""
+    if output["fallback_applied"]:
+        note = f" (fallback: no file matched all tokens; relaxed to '{output['fallback_token']}')"
+    else:
+        note = ""
     print(f"Found {output['count']} result(s) for '{output['query']}'{note}:\n")
     for i, r in enumerate(output["results"], 1):
         rating = f"rating {r['rating']}" if r["rating"] is not None else "unrated"

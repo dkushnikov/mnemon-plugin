@@ -43,7 +43,13 @@ Pass the whole query as a single `--query` argument. The script tokenizes it and
 
 ### Fallback behavior
 
-If zero files match all tokens, the script automatically relaxes to the longest (most specific) token and returns those results with `"fallback_applied": true` in the JSON. Tell the user when this happens: *"No exact matches; showing results for `<seed-token>` only."*
+If zero files match all tokens (AND intersection is empty), the script automatically relaxes to the most specific token that actually exists in the corpus — the one with the smallest nonzero match count — and returns those results with `"fallback_applied": true` and `"fallback_token": "<token>"` in the JSON. If none of the tokens appear in any file, `fallback_applied` stays `false` and `count` is `0`.
+
+Tell the user when fallback fires, using the `fallback_token` value from the JSON:
+
+> *"No file matched all of your search terms. Showing results for `<fallback_token>` only — the most specific term I could find in the library."*
+
+Do not guess which token was used — read it from the JSON.
 
 ### Zero results
 
@@ -58,6 +64,7 @@ The script returns JSON shaped like:
   "query": "karpathy knowledge bases",
   "tokens": ["karpathy", "knowledge", "bases"],
   "fallback_applied": false,
+  "fallback_token": null,
   "count": 2,
   "results": [
     {
