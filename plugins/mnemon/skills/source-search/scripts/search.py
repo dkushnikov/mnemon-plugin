@@ -346,7 +346,12 @@ def main() -> int:
     if args.human:
         _print_human(output)
     else:
-        json.dump(output, sys.stdout, ensure_ascii=False, indent=2)
+        # default=str handles types PyYAML produces that json doesn't know
+        # about natively — notably datetime.date/datetime.datetime from
+        # YAML 1.1 implicit typing of fields like `created: 2026-04-04`.
+        # str(date) gives "2026-04-04" which is exactly what we want in
+        # the JSON output consumed by the skill.
+        json.dump(output, sys.stdout, ensure_ascii=False, indent=2, default=str)
         sys.stdout.write("\n")
     return 0
 
