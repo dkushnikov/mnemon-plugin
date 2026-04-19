@@ -15,6 +15,7 @@ Add a source to the knowledge library. The gateway fetches content, applies an e
 /source-add --origin audio --url https://podcast.example.com/episode.mp3
 /source-add --origin idea --title "My insight about X"
 /source-add --origin book --title "Book Title" --author "Author Name"
+/source-add --url https://spa-site.com/ --render     # JS-heavy SPA: pre-render via headless Chrome
 ```
 
 ## Parameters
@@ -28,6 +29,19 @@ Add a source to the knowledge library. The gateway fetches content, applies an e
 | `--source-type <type>` | No | From origin | `article`, `video`, `podcast`, `book`, `paper`, `idea`, `conversation` |
 | `--intent <text>` | No | none | Why you're capturing this |
 | `--context <ctx>` | No | personal | `personal` or `mc` |
+| `--render` | No | off | Pre-render URL via Chrome headless (for SPAs / client-side-rendered pages). Requires Google Chrome or Chromium. |
+
+## When to use `--render`
+
+Plain HTTP fetch returns empty `<div id="root">` for client-side-rendered apps (React/Vue/Svelte SPAs). Symptoms when you should retry with `--render`:
+
+- Extract is suspiciously short (hero/tagline only, no body content)
+- Source is a landing page, docs site, or dashboard built as a SPA
+- You see the page fine in browser but extract is mostly meta tags
+
+Pass `--render` and Mnemon pre-renders via Chrome headless (~2-5s latency), keeping the URL canonical in frontmatter. Falls back with a clear error if Chrome/Chromium isn't installed.
+
+Do NOT use `--render` reflexively — default fast path is fine for 90% of web content. Use when you see SPA symptoms.
 
 ## How to Execute
 
