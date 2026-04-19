@@ -16,20 +16,31 @@ Add a source to the knowledge library. The gateway fetches content, applies an e
 /source-add --origin idea --title "My insight about X"
 /source-add --origin book --title "Book Title" --author "Author Name"
 /source-add --url https://spa-site.com/ --render     # JS-heavy SPA: pre-render via headless Chrome
+/source-add --file ~/Downloads/paper.pdf             # local PDF: auto-detected, Read tool extracts
+/source-add --url https://arxiv.org/pdf/2401.12345.pdf   # remote PDF: auto-detected, downloaded to /tmp
 ```
 
 ## Parameters
 
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
-| `--url <url>` | For URL sources | — | Source URL (YouTube auto-detected) |
-| `--origin <type>` | Auto-detected | From URL | `url`, `youtube`, `audio`, `text`, `book`, `idea` |
+| `--url <url>` | For URL sources | — | Source URL (YouTube / .pdf auto-detected) |
+| `--file <path>` | For local files | — | Local file path (audio or PDF, auto-detected by extension) |
+| `--origin <type>` | Auto-detected | From URL/file | `url`, `youtube`, `audio`, `pdf`, `text`, `book`, `idea` |
 | `--title <title>` | For text/book/idea | Inferred | Source title |
 | `--author <name>` | No | Inferred | Source author |
 | `--source-type <type>` | No | From origin | `article`, `video`, `podcast`, `book`, `paper`, `idea`, `conversation` |
 | `--intent <text>` | No | none | Why you're capturing this |
 | `--context <ctx>` | No | personal | `personal` or `mc` |
 | `--render` | No | off | Pre-render URL via Chrome headless (for SPAs / client-side-rendered pages). Requires Google Chrome or Chromium. |
+
+## PDF capture
+
+Both local PDFs (`--file paper.pdf`) and remote PDFs (`--url https://.../x.pdf`) auto-detect as `origin=pdf` (source_type=paper). Remote PDFs are downloaded to `/tmp` first; original URL stays canonical in frontmatter.
+
+Extraction uses Claude Code's native `Read` tool — no pypdf/pdftotext preprocessing. This handles text, layout, tables, and images/OCR content that CLI tools would miss. No `--render` / `--whisper` needed.
+
+Page count lands in frontmatter (`pages: N`). For PDFs with heavy image/figure content, the extract describes the visual layout where relevant.
 
 ## When to use `--render`
 
