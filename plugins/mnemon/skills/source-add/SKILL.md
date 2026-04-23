@@ -36,11 +36,11 @@ Add a source to the knowledge library. The gateway fetches content, applies an e
 
 ## PDF capture
 
-Both local PDFs (`--file paper.pdf`) and remote PDFs (`--url https://.../x.pdf`) auto-detect as `origin=pdf` (source_type=paper). Remote PDFs are downloaded to `/tmp` first; original URL stays canonical in frontmatter.
+Both local PDFs (`--file paper.pdf`) and remote PDFs (`--url https://.../x.pdf`) auto-detect as `origin=pdf` (source_type=paper). The original PDF is archived to `iCloud Claude Data/Mnemon/originals/` (L1) before extraction; for local files, the original path is recorded as `origin_path:` in frontmatter.
 
 Extraction uses Claude Code's native `Read` tool — no pypdf/pdftotext preprocessing. This handles text, layout, tables, and images/OCR content that CLI tools would miss. No `--render` / `--whisper` needed.
 
-Page count lands in frontmatter (`pages: N`). For PDFs with heavy image/figure content, the extract describes the visual layout where relevant.
+Page count lands in frontmatter (`pages: N`). Archive path in frontmatter (`archive: Mnemon/originals/<date>_<hash>.pdf`, relative to iCloud Claude Data/). For PDFs with heavy image/figure content, the extract describes the visual layout where relevant.
 
 ## When to use `--render`
 
