@@ -661,6 +661,324 @@ class EndToEndTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Hybrid search — qmd semantic layer
+# ---------------------------------------------------------------------------
+#
+# These cover the qmd integration added in feat/hybrid-search. The qmd binary
+# is external and stateful, so the impure shell-out is isolated to one thin
+# runner and everything testable is a pure function fed canned qmd output.
+
+# A trimmed but faithful sample of `qmd vsearch --json` stdout. Note:
+# - paths are normalized by qmd: lowercase, `_` -> `-` (real folder is
+#   `Sources/2026-05-31_b6552fcb/`, qmd emits `sources/2026-05-31-b6552fcb/`).
+# - the SAME folder (b6552fcb) appears twice — once via source.md, once via
+#   extract.md — so dedupe-by-folder must collapse them, keeping max score.
+SAMPLE_QMD_JSON = """[
+  {"docid": "#099150", "score": 0.71, "file": "qmd://obsidian-knowledge/sources/2026-05-31-b6552fcb/source.md", "title": "source", "snippet": "machine learning reinforcement learning"},
+  {"docid": "#6ccb6f", "score": 0.65, "file": "qmd://obsidian-knowledge/sources/2026-05-31-b6552fcb/extract.md", "title": "Summary", "snippet": "tags: [reinforcement-learning, offline-rl]"},
+  {"docid": "#9bf8a9", "score": 0.64, "file": "qmd://obsidian-knowledge/sources/2026-05-31-9416b3fd/source.md", "title": "source", "snippet": "data-efficient reinforcement learning"}
+]"""
+
+SAMPLE_QMD_STDERR = (
+    "├─ reinforcement learning 1\n"
+    "├─ vec: introduction to reinforcement learning concepts\n"
+    "Tip: Index last updated 14 days ago. Run 'qmd update' to refresh.\n"
+    "Searching 3 vector queries...\n"
+)
+
+
+class ParseQmdJsonTests(unittest.TestCase):
+    def test_parses_clean_array(self):
+        out = search.parse_qmd_json(SAMPLE_QMD_JSON)
+        self.assertIsInstance(out, list)
+        self.assertEqual(len(out), 3)
+        self.assertIn("b6552fcb", out[0]["file"])
+        self.assertEqual(out[0]["score"], 0.71)
+
+    def test_tolerates_leading_preamble(self):
+        # Defensive: if a future qmd prints anything before the array on
+        # stdout, we still recover the JSON from the first '['.
+        noisy = "some banner line\nanother\n" + SAMPLE_QMD_JSON
+        out = search.parse_qmd_json(noisy)
+        self.assertEqual(len(out), 3)
+
+    def test_empty_array_is_empty_list(self):
+        self.assertEqual(search.parse_qmd_json("[]"), [])
+
+    def test_garbage_returns_none(self):
+        # No parseable array at all -> None (signals "qmd output unusable").
+        self.assertIsNone(search.parse_qmd_json("no json here"))
+        self.assertIsNone(search.parse_qmd_json(""))
+
+
+class ParseQmdStaleDaysTests(unittest.TestCase):
+    def test_extracts_day_count(self):
+        self.assertEqual(search.parse_qmd_stale_days(SAMPLE_QMD_STDERR), 14)
+
+    def test_singular_day(self):
+        self.assertEqual(
+            search.parse_qmd_stale_days("Index last updated 1 day ago."), 1)
+
+    def test_no_staleness_line_returns_none(self):
+        self.assertIsNone(
+            search.parse_qmd_stale_days("Searching 3 vector queries...\n"))
+
+
+class ResolveQmdFileTests(unittest.TestCase):
+    """qmd normalizes paths (lowercase, '_'->'-'), so we map back via the
+    unique 8-hex folder hash and prefer the curated extract.md."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.vault = Path(self.tmpdir) / "vault"
+        (self.vault / "Sources").mkdir(parents=True)
+        # Folder WITH an extract.md (plus a source.md).
+        write_extract(
+            self.vault / "Sources" / "2026-05-31_b6552fcb",
+            title="Levine keynote", rating=7, domains=["mc/ai"],
+            created="2026-05-31", body="offline rl",
+        )
+        write_source(self.vault / "Sources" / "2026-05-31_b6552fcb", "raw transcript")
+        # Folder with ONLY a source.md (no extract yet).
+        write_source(self.vault / "Sources" / "2026-05-31_9416b3fd", "riedmiller raw")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir)
+
+    def test_prefers_extract_even_when_qmd_hit_source(self):
+        got = search.resolve_qmd_file(
+            "qmd://obsidian-knowledge/sources/2026-05-31-b6552fcb/source.md",
+            self.vault)
+        self.assertIsNotNone(got)
+        self.assertEqual(got.name, "extract.md")
+        self.assertIn("b6552fcb", str(got))
+
+    def test_falls_back_to_source_when_no_extract(self):
+        got = search.resolve_qmd_file(
+            "qmd://obsidian-knowledge/sources/2026-05-31-9416b3fd/source.md",
+            self.vault)
+        self.assertIsNotNone(got)
+        self.assertEqual(got.name, "source.md")
+
+    def test_unknown_hash_returns_none(self):
+        got = search.resolve_qmd_file(
+            "qmd://obsidian-knowledge/sources/2026-01-01-deadbeef/source.md",
+            self.vault)
+        self.assertIsNone(got)
+
+    def test_non_sources_path_returns_none(self):
+        got = search.resolve_qmd_file(
+            "qmd://obsidian-knowledge/synthesis/my-note.md", self.vault)
+        self.assertIsNone(got)
+
+    def test_strips_line_and_docid_suffixes(self):
+        # Text-mode qmd paths carry ":line #docid"; the scheme's own "://"
+        # must survive a naive colon-split. This guards that bug.
+        got = search.resolve_qmd_file(
+            "qmd://obsidian-knowledge/sources/2026-05-31-b6552fcb/extract.md:9 #6ccb6f",
+            self.vault)
+        self.assertIsNotNone(got)
+        self.assertEqual(got.name, "extract.md")
+
+
+class _FakeProc:
+    """Stand-in for subprocess.CompletedProcess so qmd never runs in tests."""
+    def __init__(self, stdout="", stderr="", returncode=0):
+        self.stdout, self.stderr, self.returncode = stdout, stderr, returncode
+
+
+class SemanticSearchTests(unittest.TestCase):
+    """The qmd layer must be an enhancement, never load-bearing: every failure
+    mode degrades to available=False + a reason, never an exception."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.vault = Path(self.tmpdir) / "vault"
+        (self.vault / "Sources").mkdir(parents=True)
+        write_extract(self.vault / "Sources" / "2026-05-31_b6552fcb",
+                      title="Levine keynote", rating=7, domains=["mc/ai"],
+                      created="2026-05-31", body="offline rl")
+        write_source(self.vault / "Sources" / "2026-05-31_b6552fcb", "raw")
+        write_extract(self.vault / "Sources" / "2026-05-31_9416b3fd",
+                      title="Riedmiller talk", rating=5, domains=["mc/ai"],
+                      created="2026-05-31", body="data efficient rl")
+        write_source(self.vault / "Sources" / "2026-05-31_9416b3fd", "raw2")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir)
+
+    def _run_ok(self, argv):
+        return _FakeProc(SAMPLE_QMD_JSON, SAMPLE_QMD_STDERR, 0)
+
+    def test_maps_enriches_dedupes_sorts(self):
+        out = search.semantic_search("rl", "obsidian-knowledge", self.vault, 10,
+                                     run=self._run_ok)
+        self.assertTrue(out["available"])
+        self.assertEqual(out["index_stale_days"], 14)
+        # b6552fcb appears twice in SAMPLE (source + extract) -> deduped to 1.
+        self.assertEqual(len(out["results"]), 2)
+        top = out["results"][0]
+        self.assertEqual(top["title"], "Levine keynote")  # 0.71 is highest
+        self.assertEqual(top["score"], 0.71)
+        self.assertEqual(top["rating"], 7)         # enriched from extract.md frontmatter
+        self.assertEqual(top["engine"], "semantic")
+        self.assertNotIn("@@", top["snippet"])     # qmd diff-header cleaned out
+
+    def test_dedupe_keeps_max_score(self):
+        out = search.semantic_search("rl", "obsidian-knowledge", self.vault, 10,
+                                     run=self._run_ok)
+        b = [r for r in out["results"] if "b6552fcb" in r["path"]][0]
+        self.assertEqual(b["score"], 0.71)
+
+    def test_fail_open_on_nonzero_exit(self):
+        # The ABI-crash scenario: qmd exits non-zero. Must NOT raise.
+        def run_crash(argv):
+            return _FakeProc("", "Error: NODE_MODULE_VERSION 141 ...", 1)
+        out = search.semantic_search("rl", "obsidian-knowledge", self.vault, 10,
+                                     run=run_crash)
+        self.assertFalse(out["available"])
+        self.assertIn("exited 1", out["reason"])
+        self.assertEqual(out["results"], [])
+
+    def test_fail_open_when_runner_raises(self):
+        def run_boom(argv):
+            raise FileNotFoundError("qmd")
+        out = search.semantic_search("rl", "obsidian-knowledge", self.vault, 10,
+                                     run=run_boom)
+        self.assertFalse(out["available"])
+        self.assertIsNotNone(out["reason"])
+        self.assertEqual(out["results"], [])
+
+    def test_unparseable_output_fails_open(self):
+        def run_garbage(argv):
+            return _FakeProc("not json at all", "", 0)
+        out = search.semantic_search("rl", "obsidian-knowledge", self.vault, 10,
+                                     run=run_garbage)
+        self.assertFalse(out["available"])
+        self.assertIn("unparseable", out["reason"])
+
+    def test_no_collection_unavailable(self):
+        out = search.semantic_search("rl", "", self.vault, 10, run=self._run_ok)
+        self.assertFalse(out["available"])
+
+    def test_qmd_missing_unavailable(self):
+        orig = search._qmd_on_path
+        search._qmd_on_path = lambda: False
+        try:
+            out = search.semantic_search("rl", "obsidian-knowledge", self.vault, 10)
+        finally:
+            search._qmd_on_path = orig
+        self.assertFalse(out["available"])
+        self.assertIn("not installed", out["reason"])
+
+    def test_default_uses_vsearch(self):
+        seen = {}
+        def cap(argv):
+            seen["argv"] = argv
+            return self._run_ok(argv)
+        search.semantic_search("rl", "obsidian-knowledge", self.vault, 5, run=cap)
+        self.assertIn("vsearch", seen["argv"])
+
+    def test_deep_uses_query_subcommand(self):
+        seen = {}
+        def cap(argv):
+            seen["argv"] = argv
+            return self._run_ok(argv)
+        search.semantic_search("rl", "obsidian-knowledge", self.vault, 5,
+                               deep=True, run=cap)
+        self.assertIn("query", seen["argv"])
+        self.assertNotIn("vsearch", seen["argv"])
+
+
+class EngineIntegrationTests(unittest.TestCase):
+    """End-to-end through main() with a FAKE qmd on PATH — exercises the real
+    subprocess wiring, the search_provider gate, and cross-block dedup, without
+    touching the user's real qmd index."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.vault = Path(self.tmpdir) / "vault"
+        (self.vault / "Sources").mkdir(parents=True)
+        write_extract(self.vault / "Sources" / "2026-05-31_b6552fcb",
+                      title="Levine keynote", rating=7, domains=["mc/ai"],
+                      created="2026-05-31", body="offline rl, levine on agents")
+        write_extract(self.vault / "Sources" / "2026-05-31_9416b3fd",
+                      title="Riedmiller talk", rating=5, domains=["mc/ai"],
+                      created="2026-05-31", body="data efficient control")
+        # Fake qmd on PATH: prints canned vsearch JSON to stdout, stale tip to stderr.
+        self.bindir = Path(self.tmpdir) / "bin"
+        self.bindir.mkdir()
+        (self.bindir / "out.json").write_text(SAMPLE_QMD_JSON, encoding="utf-8")
+        fake = self.bindir / "qmd"
+        fake.write_text(
+            "#!/bin/sh\n"
+            f"cat '{self.bindir}/out.json'\n"
+            "echo \"Tip: Index last updated 14 days ago. Run 'qmd update'.\" 1>&2\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        self.config = Path(self.tmpdir) / "mnemon.yaml"
+        self.config.write_text(
+            f"vault_path: {self.vault}\n"
+            "search_provider: qmd\n"
+            "qmd_collection: obsidian-knowledge\n"
+        )
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir)
+
+    def _run(self, *args) -> dict:
+        env = os.environ.copy()
+        env["MNEMON_CONFIG"] = str(self.config)
+        env["PATH"] = str(self.bindir) + os.pathsep + env["PATH"]
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT_DIR / "search.py"), *args],
+            capture_output=True, text=True, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_hybrid_returns_both_blocks_and_excludes_keyword_dupes(self):
+        out = self._run("--query", "levine")
+        self.assertEqual(out["engine"], "auto")
+        # keyword block: only b6552fcb matches "levine"
+        self.assertEqual(out["count"], 1)
+        self.assertIn("b6552fcb", out["results"][0]["path"])
+        # semantic block present + available, staleness surfaced
+        self.assertTrue(out["semantic"]["available"])
+        self.assertEqual(out["semantic"]["index_stale_days"], 14)
+        # b6552fcb already in keyword results -> excluded from semantic
+        sem_paths = [r["path"] for r in out["semantic"]["results"]]
+        self.assertTrue(all("b6552fcb" not in p for p in sem_paths))
+        self.assertTrue(any("9416b3fd" in p for p in sem_paths))
+        self.assertEqual(out["semantic"]["results"][0]["engine"], "semantic")
+
+    def test_engine_keyword_disables_semantic(self):
+        out = self._run("--query", "levine", "--engine", "keyword")
+        self.assertEqual(out["engine"], "keyword")
+        self.assertFalse(out["semantic"]["available"])
+        self.assertEqual(out["semantic"]["results"], [])
+        self.assertEqual(out["count"], 1)  # keyword still works
+
+    def test_engine_semantic_only_skips_keyword(self):
+        out = self._run("--query", "levine", "--engine", "semantic")
+        self.assertEqual(out["count"], 0)        # pure semantic: no keyword block
+        self.assertEqual(out["results"], [])
+        self.assertTrue(out["semantic"]["available"])
+        sem_paths = [r["path"] for r in out["semantic"]["results"]]
+        self.assertTrue(any("b6552fcb" in p for p in sem_paths))  # nothing to exclude
+
+    def test_provider_not_qmd_disables_semantic(self):
+        self.config.write_text(
+            f"vault_path: {self.vault}\nsearch_provider: grep\nqmd_collection: x\n")
+        out = self._run("--query", "levine")
+        self.assertFalse(out["semantic"]["available"])
+        self.assertIn("search_provider", (out["semantic"]["reason"] or ""))
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 

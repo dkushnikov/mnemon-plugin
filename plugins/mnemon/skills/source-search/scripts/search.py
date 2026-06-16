@@ -8,17 +8,24 @@ sources matching the query. Results are ranked by rating DESC then date DESC.
 
 Design notes
 ------------
+- Engine: by default (`--engine auto`) the keyword layer below runs AND a
+  semantic layer backed by qmd (vector search) runs; output carries two
+  blocks — `results` (keyword, rating-ranked) and `semantic.results`
+  (meaning-based, score-ranked, with keyword dupes removed). The semantic
+  layer is a STRICT enhancement: gated on search_provider=qmd and fully
+  fail-open — a missing/broken qmd or empty index degrades to keyword-only
+  and says so. See the "qmd semantic layer" section. Override with
+  `--engine keyword|semantic|deep` (deep = qmd hybrid 'query', slower).
 - Tokenization: query is split into lowercase tokens >=2 chars long. We
   find files containing ALL tokens (AND semantics). This is what you want
   99% of the time — "karpathy knowledge bases" should match files that
   contain all three words, not the literal phrase.
-- Fallback: if no file matches all tokens, we relax to just the longest
-  (most specific) token and mark results with a `fallback` flag so the
-  caller can tell the user we broadened the search.
-- Frontmatter parsing: we parse only the subset Mnemon extracts use —
-  scalar strings (quoted or not), integers, inline lists [a, b, c]. No
-  PyYAML dependency — keeps the script portable across any machine with
-  python3.
+- Fallback: if no file matches all tokens, we relax to the most *specific*
+  token that exists in the corpus (fewest matching files, not longest
+  string) and mark results with a `fallback` flag so the caller can tell
+  the user we broadened the search.
+- Frontmatter parsing: real YAML via PyYAML (yaml.safe_load) — handles the
+  inline lists, block lists, and YAML-1.1 date scalars Mnemon extracts use.
 - Output: JSON to stdout by default. The skill reads the JSON and formats
   it for the user. If you want human output for ad-hoc CLI use, pass
   --human.
@@ -30,6 +37,8 @@ import argparse
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -300,6 +309,205 @@ def dedupe_by_folder(results: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# qmd semantic layer (hybrid search)
+# ---------------------------------------------------------------------------
+#
+# The keyword search above is the reliable floor: pure Python, no external
+# deps, reads live files. The qmd layer is a strict *enhancement* — it adds
+# vector-semantic recall ("find notes about this idea even if they don't
+# contain the words"). It must NEVER be load-bearing: if qmd is missing,
+# broken (e.g. ABI mismatch after a Node upgrade), or its index is empty, the
+# search degrades silently to keyword-only and says so. qmd is invoked via the
+# `qmd` name on PATH so the user's runtime wrapper (~/.local/bin/qmd) is
+# honored.
+
+
+def parse_qmd_json(stdout: str) -> list | None:
+    """Parse `qmd ... --json` stdout into a list of raw hit dicts.
+
+    Returns None when no JSON array can be recovered (signals "qmd output
+    unusable" → caller degrades to keyword-only). Returns [] for a valid but
+    empty result set. qmd writes clean JSON to stdout today; the first-'['
+    recovery is defensive against future stdout preamble.
+    """
+    if not stdout:
+        return None
+    text = stdout.strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        idx = text.find("[")
+        if idx == -1:
+            return None
+        try:
+            data = json.loads(text[idx:])
+        except json.JSONDecodeError:
+            return None
+    return data if isinstance(data, list) else None
+
+
+_QMD_STALE_RE = re.compile(r"last updated (\d+) days? ago", re.IGNORECASE)
+
+
+def parse_qmd_stale_days(stderr: str) -> int | None:
+    """Extract qmd's 'Index last updated N days ago' tip from stderr.
+
+    Returns the day count so the skill can warn that recent captures may be
+    missing from the semantic index. None when no such tip is present.
+    """
+    if not stderr:
+        return None
+    m = _QMD_STALE_RE.search(stderr)
+    return int(m.group(1)) if m else None
+
+
+_QMD_HASH_RE = re.compile(r"[0-9a-f]{8}")
+
+
+def resolve_qmd_file(qmd_path: str, vault: Path) -> Path | None:
+    """Map a normalized qmd:// file path back to the real vault file to show.
+
+    qmd normalizes paths (lowercase, '_'->'-'), so the name can't be
+    reconstructed losslessly. Mnemon source folders are `YYYY-MM-DD_<hash8>`
+    where hash8 is a unique 8-hex id; we key off that. Prefers the curated
+    extract.md over the raw source.md (mirrors dedupe_by_folder's tier
+    priority). Returns None for non-Sources hits or unknown hashes — the
+    caller simply drops those, never crashes.
+    """
+    if not qmd_path:
+        return None
+    # Strip trailing " #docid" and ":line" without harming the "://" scheme.
+    s = qmd_path.strip()
+    s = re.sub(r"\s+#\w+$", "", s)
+    s = re.sub(r":\d+$", "", s)
+
+    folder_part = s.rsplit("/", 1)[0] if "/" in s else s
+    folder_seg = folder_part.rsplit("/", 1)[-1]
+    if "/sources/" not in s.lower() and not s.lower().startswith("sources/"):
+        return None
+    m = _QMD_HASH_RE.search(folder_seg)
+    if not m:
+        return None
+    hash8 = m.group(0)
+
+    sources_dir = vault / "Sources"
+    if not sources_dir.is_dir():
+        return None
+    for folder in sources_dir.glob(f"*{hash8}"):
+        if not folder.is_dir():
+            continue
+        extract = folder / "extract.md"
+        if extract.is_file():
+            return extract
+        hit = folder / Path(s).name
+        if hit.is_file():
+            return hit
+        mds = sorted(folder.glob("*.md"))
+        return mds[0] if mds else None
+    return None
+
+
+def _clean_qmd_snippet(snippet: str, width: int = 200) -> str:
+    """Turn qmd's diff-style snippet ('@@ -29,4 @@ ...\\nline\\nline') into a
+    single readable line showing the semantically-matched passage."""
+    if not snippet:
+        return ""
+    s = re.sub(r"@@[^@]*@@", "", snippet)
+    s = " ".join(s.split())
+    return (s[:width] + "…") if len(s) > width else s
+
+
+def _qmd_on_path() -> bool:
+    """Whether the `qmd` binary is resolvable on PATH (honors the user's
+    wrapper at ~/.local/bin/qmd). Isolated for monkeypatching in tests."""
+    return shutil.which("qmd") is not None
+
+
+def _run_qmd(argv: list[str]) -> subprocess.CompletedProcess:
+    """Thin, mockable shell-out to qmd. The ONLY impure point of the layer."""
+    return subprocess.run(argv, capture_output=True, text=True)
+
+
+def semantic_search(
+    query: str,
+    collection: str,
+    vault: Path,
+    limit: int,
+    *,
+    deep: bool = False,
+    run=None,
+) -> dict:
+    """Run qmd vector search and map hits onto the same result shape as the
+    keyword layer. STRICTLY fail-open: any missing binary / non-zero exit /
+    unparseable output returns {available: False, reason, results: []} — never
+    raises. `run` is an injectable runner (argv -> CompletedProcess) for tests.
+
+    Returns: {available, reason, index_stale_days, results:[{...assemble_result
+    fields..., engine:"semantic", score:float}]}.
+    """
+    result: dict = {"available": False, "reason": None,
+                    "index_stale_days": None, "results": []}
+
+    if not collection:
+        result["reason"] = "no qmd_collection configured"
+        return result
+
+    if run is None:
+        if not _qmd_on_path():
+            result["reason"] = "qmd not installed"
+            return result
+        run = _run_qmd
+
+    fetch_n = max(limit * 3, 15)
+    subcmd = "query" if deep else "vsearch"
+    argv = ["qmd", subcmd, query, "-c", collection,
+            "--limit", str(fetch_n), "--json"]
+
+    try:
+        proc = run(argv)
+    except Exception as e:  # FileNotFoundError, OSError, ... — never propagate
+        result["reason"] = f"qmd invocation failed: {e}"
+        return result
+
+    if getattr(proc, "returncode", 1) != 0:
+        first = (proc.stderr or "").strip().splitlines()
+        detail = f": {first[0]}" if first else ""
+        result["reason"] = f"qmd exited {proc.returncode}{detail}"
+        return result
+
+    hits = parse_qmd_json(proc.stdout or "")
+    if hits is None:
+        result["reason"] = "qmd output unparseable"
+        return result
+
+    result["index_stale_days"] = parse_qmd_stale_days(proc.stderr or "")
+
+    by_folder: dict[str, dict] = {}
+    for hit in hits:
+        f = resolve_qmd_file(hit.get("file", ""), vault)
+        if f is None:
+            continue
+        if f.name == "extract.md":
+            tier = "extract"
+        elif "Synthesis" in f.parts:
+            tier = "synthesis"
+        else:
+            tier = "source"
+        score = hit.get("score")
+        rec = assemble_result(f, tier, _clean_qmd_snippet(hit.get("snippet", "")), vault)
+        rec["engine"] = "semantic"
+        rec["score"] = score
+        key = rec["path"]
+        if key not in by_folder or (score or 0) > (by_folder[key].get("score") or 0):
+            by_folder[key] = rec
+
+    ranked = sorted(by_folder.values(), key=lambda r: -(r.get("score") or 0))
+    result["results"] = ranked[:limit]
+    result["available"] = True
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -313,6 +521,11 @@ def main() -> int:
     parser.add_argument("--include-synthesis", action="store_true",
                         help="Also search Synthesis/ directory")
     parser.add_argument("--human", action="store_true", help="Human-readable output instead of JSON")
+    parser.add_argument(
+        "--engine", choices=["auto", "keyword", "semantic", "deep"], default="auto",
+        help="auto: keyword + fast vector semantic (default). keyword: keyword only. "
+             "semantic: vector only. deep: keyword + qmd hybrid 'query' (expansion+rerank, slower). "
+             "Semantic layers require search_provider=qmd; otherwise they degrade to keyword.")
     args = parser.parse_args()
 
     try:
@@ -381,13 +594,43 @@ def main() -> int:
     results = rank_results(results)
     results = results[: args.limit]
 
+    run_keyword = args.engine in ("auto", "keyword", "deep")
+    run_semantic = args.engine in ("auto", "semantic", "deep")
+
+    # In pure-semantic mode the keyword block is suppressed (the scan above is
+    # cheap and harmless; we just don't surface it).
+    if not run_keyword:
+        results, fallback_applied, fallback_token = [], False, None
+
+    # --- Semantic (qmd) block: STRICT enhancement, gated on search_provider=qmd ---
+    provider = (cfg.get("search_provider") or "").strip().lower()
+    collection = cfg.get("qmd_collection") or ""
+    if not run_semantic:
+        semantic = {"available": False, "reason": f"not requested (engine={args.engine})",
+                    "index_stale_days": None, "results": [], "count": 0}
+    elif provider != "qmd":
+        semantic = {"available": False,
+                    "reason": f"semantic disabled (search_provider={provider or 'unset'})",
+                    "index_stale_days": None, "results": [], "count": 0}
+    else:
+        semantic = semantic_search(args.query, collection, vault, args.limit,
+                                   deep=(args.engine == "deep"))
+        # Drop folders the keyword block already surfaced — the semantic block
+        # shows only what meaning-based recall ADDS, not duplicates.
+        kw_paths = {r["path"] for r in results}
+        semantic["results"] = [r for r in semantic["results"] if r["path"] not in kw_paths]
+        semantic.setdefault("count", 0)
+        semantic["count"] = len(semantic["results"])
+
     output = {
         "query": args.query,
         "tokens": tokens,
+        "engine": args.engine,
         "fallback_applied": fallback_applied,
         "fallback_token": fallback_token,
         "count": len(results),
         "results": results,
+        "semantic": semantic,
     }
 
     if args.human:
@@ -403,28 +646,43 @@ def main() -> int:
     return 0
 
 
+def _print_human_result(i: int, r: dict) -> None:
+    rating = f"rating {r['rating']}" if r["rating"] is not None else "unrated"
+    domains = ", ".join(r["domains"]) if r["domains"] else "—"
+    score = f" · score {r['score']:.2f}" if r.get("score") is not None else ""
+    print(f"{i}. {r['title']}{score}")
+    if r["author"]:
+        print(f"   by {r['author']}")
+    print(f"   {rating} · {r['created']} · domains: {domains} · tier: {r['tier']}")
+    if r["url"]:
+        print(f"   {r['url']}")
+    if r["snippet"]:
+        print(f"   → {r['snippet']}")
+    print(f"   path: {r['path']}")
+    print()
+
+
 def _print_human(output: dict) -> None:
     if output["count"] == 0:
-        print(f"No sources found for '{output['query']}'.")
-        return
-    if output["fallback_applied"]:
-        note = f" (fallback: no file matched all tokens; relaxed to '{output['fallback_token']}')"
+        print(f"No keyword results for '{output['query']}'.")
     else:
-        note = ""
-    print(f"Found {output['count']} result(s) for '{output['query']}'{note}:\n")
-    for i, r in enumerate(output["results"], 1):
-        rating = f"rating {r['rating']}" if r["rating"] is not None else "unrated"
-        domains = ", ".join(r["domains"]) if r["domains"] else "—"
-        print(f"{i}. {r['title']}")
-        if r["author"]:
-            print(f"   by {r['author']}")
-        print(f"   {rating} · {r['created']} · domains: {domains} · tier: {r['tier']}")
-        if r["url"]:
-            print(f"   {r['url']}")
-        if r["snippet"]:
-            print(f"   → {r['snippet']}")
-        print(f"   path: {r['path']}")
-        print()
+        if output["fallback_applied"]:
+            note = f" (fallback: no file matched all tokens; relaxed to '{output['fallback_token']}')"
+        else:
+            note = ""
+        print(f"Found {output['count']} result(s) for '{output['query']}'{note}:\n")
+        for i, r in enumerate(output["results"], 1):
+            _print_human_result(i, r)
+
+    sem = output.get("semantic") or {}
+    stale = sem.get("index_stale_days")
+    if sem.get("available") and sem.get("results"):
+        warn = f" — ⚠ index {stale}d stale, run 'qmd update'" if stale and stale > 7 else ""
+        print(f"Semantically related ({sem['count']}){warn}:\n")
+        for i, r in enumerate(sem["results"], 1):
+            _print_human_result(i, r)
+    elif sem.get("reason") and output.get("engine") != "keyword":
+        print(f"(semantic unavailable: {sem['reason']})")
 
 
 if __name__ == "__main__":

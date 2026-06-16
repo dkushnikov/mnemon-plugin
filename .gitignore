@@ -1,0 +1,4 @@
+# Python build artifacts (from running the bundled skill scripts / tests)
+__pycache__/
+*.py[cod]
+.pytest_cache/
