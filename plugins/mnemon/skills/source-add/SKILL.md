@@ -76,7 +76,7 @@ Do NOT use `--render` reflexively — default fast path is fine for 90% of web c
 2. Call the gateway via the Bash tool:
 
 ```bash
-${MNEMON_HOME:-~/Mnemon}/bin/knowledge-gateway.sh source-add --url "<url>" [--origin <origin>] [--title "<title>"] [--author "<author>"] [--intent "<intent>"]
+${MNEMON_HOME:-$HOME/Mnemon}/bin/knowledge-gateway.sh source-add --url "<url>" [--origin <origin>] [--title "<title>"] [--author "<author>"] [--intent "<intent>"]
 ```
 
 3. Parse RESULT lines from the output:
@@ -93,7 +93,7 @@ Status: <status>
 ```
 
 5. If the gateway fails, show the error message. Common issues:
-   - "No mnemon.yaml found" → run `${MNEMON_HOME:-~/Mnemon}/setup.sh <vault-path>` first
+   - "No mnemon.yaml found" → run `${MNEMON_HOME:-$HOME/Mnemon}/setup.sh <vault-path>` first
    - "Vault not found" → check vault_path in mnemon.yaml
    - Media extraction failed → check yt-dlp/whisper installation
 
@@ -102,5 +102,5 @@ Status: <status>
 If the user wants to capture text or an idea, they need to provide the content. Ask them to paste it, then pipe it to the gateway:
 
 ```bash
-echo "<pasted content>" | ${MNEMON_HOME:-~/Mnemon}/bin/knowledge-gateway.sh source-add --origin text --title "<title>"
+echo "<pasted content>" | ${MNEMON_HOME:-$HOME/Mnemon}/bin/knowledge-gateway.sh source-add --origin text --title "<title>"
 ```
