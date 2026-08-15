@@ -20,7 +20,8 @@ No parameters needed.
 Call the gateway status action:
 
 ```bash
-${MNEMON_HOME:-$HOME/Mnemon}/bin/knowledge-gateway.sh status
+M="${MNEMON_HOME:-$HOME/Mnemon}"; M="${M/#\~/$HOME}"   # tolerate literal ~ (settings env is not shell-expanded)
+"$M/bin/knowledge-gateway.sh" status
 ```
 
 The gateway outputs a formatted dashboard. Display it to the user.
@@ -29,7 +30,8 @@ If additional detail is needed (the gateway shows basics), you can augment with:
 
 ```bash
 # Count by origin
-source ${MNEMON_HOME:-$HOME/Mnemon}/bin/mnemon-config.sh && load_config
+M="${MNEMON_HOME:-$HOME/Mnemon}"; M="${M/#\~/$HOME}"
+source "$M/bin/mnemon-config.sh" && load_config
 for f in "$VAULT_PATH"/Sources/*/extract.md; do
   grep -m1 '^origin:' "$f" 2>/dev/null
 done | sort | uniq -c | sort -rn

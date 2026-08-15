@@ -29,4 +29,4 @@ claude plugin update mnemon@mnemon-plugin
 
 Full docs, configuration, and examples: **[Mnemon README](https://github.com/dkushnikov/mnemon)**.
 
-Custom Mnemon path: set `MNEMON_HOME` if not at `~/Mnemon/`.
+Custom Mnemon path: set `MNEMON_HOME` if not at `~/Mnemon/`. Use an **absolute path** — values from Claude Code `settings.json` `env` are passed literally (no `~`/`$HOME` expansion); skills tolerate a literal `~` but other consumers may not.
